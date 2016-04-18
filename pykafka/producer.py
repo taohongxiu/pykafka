@@ -353,17 +353,19 @@ class Producer(object):
         except AttributeError:
             raise KafkaException("Delivery-reporting is disabled")
 
-    def _produce(self, message):
+    def _produce(self, message, retry=False):
         """Enqueue a message for the relevant broker
 
         :param message: Message with valid `partition_id`, ready to be sent
         :type message: `pykafka.protocol.Message`
+        :param retry: Whether _produce is being called during a retry from a worker thread
+        :type retry: bool
         """
         success = False
         while not success:
             leader_id = self._topic.partitions[message.partition_id].leader.id
             if leader_id in self._owned_brokers:
-                self._owned_brokers[leader_id].enqueue(message)
+                self._owned_brokers[leader_id].enqueue(message, retry=retry)
                 success = True
             else:
                 success = False
@@ -463,7 +465,9 @@ class Producer(object):
                         log.error("Message not delivered!! %r" % exc)
                     else:
                         msg.produce_attempt += 1
-                        self._produce(msg)
+                        import ipdb
+                        ipdb.set_trace()
+                        self._produce(msg, retry=True)
 
     def _wait_all(self):
         """Block until all pending messages are sent
@@ -550,13 +554,13 @@ class OwnedBroker(object):
         """
         return self.messages_pending > 0
 
-    def enqueue(self, message):
+    def enqueue(self, message, retry=False):
         """Push message onto the queue
 
         :param message: The message to push onto the queue
         :type message: `pykafka.protocol.Message`
         """
-        self._wait_for_slot_available()
+        self._wait_for_slot_available(override_block_on_queue_full=not retry)
         with self.lock:
             self.queue.appendleft(message)
             self.increment_messages_pending(1)
@@ -580,10 +584,13 @@ class OwnedBroker(object):
         :type release_pending: bool
         """
         self._wait_for_flush_ready(linger_ms)
+        log.info("acquiring lock in flush")
         with self.lock:
+            log.info("got lock in flush")
             batch = []
             batch_size_in_bytes = 0
             while len(self.queue) > 0:
+                log.info("flush looping")
                 peeked_message = self.queue[-1]
 
                 if peeked_message and peeked_message.value is not None:
@@ -613,13 +620,16 @@ class OwnedBroker(object):
                         self.flush_ready.set()
                         break
 
+                log.info("flush pop")
                 message = self.queue.pop()
                 batch_size_in_bytes += len(message)
+                log.info("flush append")
                 batch.append(message)
 
             if release_pending:
                 self.increment_messages_pending(-1 * len(batch))
             if not self.slot_available.is_set():
+                log.info("flush set")
                 self.slot_available.set()
         return batch
 
@@ -634,19 +644,32 @@ class OwnedBroker(object):
         :type linger_ms: int
         """
         if len(self.queue) < self.producer._min_queued_messages:
+            log.info("in flush check")
             with self.lock:
+                log.info("got flush lock")
                 if len(self.queue) < self.producer._min_queued_messages:
                     self.flush_ready.clear()
             if linger_ms > 0:
+                log.info("waiting on flush ready")
                 self.flush_ready.wait((linger_ms / 1000))
+                log.info("waited on flush ready")
 
-    def _wait_for_slot_available(self):
-        """Block until the queue has at least one slot not containing a message"""
+    def _wait_for_slot_available(self, override_block_on_queue_full=False):
+        """Block until the queue has at least one slot not containing a message
+
+        :param override_block_on_queue_full: Whether to block when the queue is full.
+            Overrides `Producer._block_on_queue_full` when `False`
+        :type override_block_on_queue_full: bool
+        """
         if len(self.queue) >= self.producer._max_queued_messages:
+            log.info("got to wait check")
             with self.lock:
+                log.info("got lock")
                 if len(self.queue) >= self.producer._max_queued_messages:
+                    log.info("cleared slot")
                     self.slot_available.clear()
-            if self.producer._block_on_queue_full:
+            if override_block_on_queue_full and self.producer._block_on_queue_full:
+                log.info("waiting on slot")
                 self.slot_available.wait()
             else:
                 raise ProducerQueueFullError("Queue full for broker %d",
